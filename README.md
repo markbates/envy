@@ -56,5 +56,5 @@ func main() {
 Run the test suite with:
 
 ```bash
-go test -v -cover -race ./...
+make test
 ```
