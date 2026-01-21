@@ -3,3 +3,6 @@ test: lint
 
 lint:
 	golangci-lint run ./...
+
+readme: test
+	hype export -o README.md

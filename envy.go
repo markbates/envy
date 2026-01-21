@@ -4,19 +4,21 @@
 package envy
 
 import (
+	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
-	"sort"
-	"sync"
+	"strings"
 )
 
 // Zero returns a new Env with no environment variables set. It is useful when
 // you want a clean slate that is completely detached from the process
 // environment.
 func Zero() *Env {
-	return &Env{
-		envs: map[string]string{},
-	}
+	return FromMap(map[string]string{})
 }
 
 // New returns an Env populated with the current process's environment
@@ -30,15 +32,22 @@ func New() *Env {
 // Malformed entries are ignored. Later entries with the same key overwrite
 // earlier ones, matching the standard environment semantics.
 func FromSlice(envs []string) *Env {
-	envMap := map[string]string{}
+	em := map[string]string{}
 	for _, env := range envs {
-		var key, value string
-		n, _ := fmt.Sscanf(env, "%[^=]=%s", &key, &value)
-		if n == 2 {
-			envMap[key] = value
+		// trim spaces
+		env = strings.TrimSpace(env)
+
+		// split into key and value
+		parts := strings.SplitN(env, "=", 2)
+		if len(parts) != 2 {
+			continue
 		}
+
+		// set key/value
+		em[parts[0]] = parts[1]
 	}
-	return FromMap(envMap)
+
+	return FromMap(em)
 }
 
 // FromMap wraps the provided map in a new Env. If the map is nil, an empty map
@@ -49,111 +58,117 @@ func FromMap(envs map[string]string) *Env {
 		envs = map[string]string{}
 	}
 
+	for k := range envs {
+		// trim spaces
+		s := strings.TrimSpace(k)
+
+		// ignore empty keys, comments, and keys with '='
+		if s == "" || strings.Contains(s, "=") || strings.HasPrefix(s, "//") {
+			delete(envs, k)
+			continue
+		}
+	}
+
 	return &Env{
 		envs: envs,
 	}
 }
 
-// Env stores environment variables in memory with thread-safe access. A nil
-// *Env is treated as empty and safe to read from, but mutating operations
-// return an error.
-type Env struct {
-	// envs is a map that holds environment variables.
-	envs map[string]string
-	mu   sync.RWMutex
-}
-
-// Getenv returns the value of the environment variable named by key. It returns
-// an empty string when the key is not present or the Env is nil, mirroring
-// os.Getenv semantics.
-func (e *Env) Getenv(key string) string {
-	if e.IsNil() {
-		return ""
+// FromReader reads environment entries from r, splitting on sep and trimming
+// surrounding whitespace. It returns an error for a nil reader or scanner
+// failures (including invalid UTF-8).
+func FromReader(r io.Reader, sep byte) (*Env, error) {
+	if r == nil {
+		return nil, fmt.Errorf("nil reader")
 	}
 
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	buf := bufio.NewScanner(r)
 
-	return e.envs[key]
-}
-
-// Setenv sets the value of the environment variable named by key. It returns an
-// error if the Env or its backing map is nil.
-func (e *Env) Setenv(key, value string) error {
-	if e.IsNil() {
-		return fmt.Errorf("nil env")
-	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	e.envs[key] = value
-	return nil
-}
-
-// Unsetenv deletes the environment variable named by key. Removing a missing
-// key is a no-op. An error is returned if the Env or its backing map is nil.
-func (e *Env) Unsetenv(key string) error {
-	if e.IsNil() {
-		return fmt.Errorf("nil env")
-	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-
-	delete(e.envs, key)
-	return nil
-}
-
-// IsNil reports whether the receiver is nil or its underlying map is nil. This
-// allows callers to safely check Env values that may not have been
-// initialized.
-func (e *Env) IsNil() bool {
-	if e == nil {
-		return true
-	}
-
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	return e.envs == nil
-}
-
-// Environ returns a sorted slice of strings in the form "key=value" for every
-// variable stored in the Env. The slice is deterministic to make comparisons in
-// tests predictable.
-func (e *Env) Environ() []string {
-	if e.IsNil() {
-		return []string{}
-	}
-
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	var envs []string
-	for k, v := range e.envs {
-		envs = append(envs, k+"="+v)
-	}
-
-	sort.Strings(envs)
-	return envs
-}
-
-// Expandenv replaces ${var} or $var in the input string according to the
-// stored environment variables. Unknown keys are replaced with the empty
-// string. If the Env is nil, the input string is returned unchanged.
-func (e *Env) Expandenv(s string) string {
-	if e.IsNil() {
-		return s
-	}
-
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-
-	return os.Expand(s, func(key string) string {
-		if val, ok := e.envs[key]; ok {
-			return val
+	buf.Split(func(data []byte, eof bool) (int, []byte, error) {
+		// trim space
+		tsd := func(b []byte) []byte {
+			return bytes.TrimSpace(b)
 		}
-		return ""
+
+		// return if no data
+		if len(data) == 0 {
+			return 0, nil, nil
+		}
+
+		// split on sep
+		if i := bytes.IndexByte(data, sep); i >= 0 {
+			return i + 1, tsd(data[0:i]), nil
+		}
+
+		// handle eof
+		if eof {
+			return len(data), tsd(data), nil
+		}
+
+		return 0, nil, nil
 	})
+
+	envs := []string{}
+	for buf.Scan() {
+		envs = append(envs, buf.Text())
+	}
+
+	if err := buf.Err(); err != nil {
+		return nil, err
+	}
+
+	return FromSlice(envs), nil
+}
+
+// FromFile reads newline-separated environment entries from the provided
+// filesystem path. It returns an error for a nil fs.FS or any read failure.
+func FromFile(cab fs.FS, path string) (e *Env, err error) {
+	if cab == nil {
+		return nil, fmt.Errorf("nil fs.FS")
+	}
+
+	f, err := cab.Open(path)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		cerr := f.Close()
+		if cerr == nil {
+			return
+		}
+
+		if err == nil {
+			err = cerr
+			return
+		}
+		err = errors.Join(err, cerr)
+	}()
+
+	lines := []string{}
+	buf := bufio.NewScanner(f)
+	for buf.Scan() {
+		lines = append(lines, buf.Text())
+	}
+
+	if err := buf.Err(); err != nil {
+		return nil, err
+	}
+
+	return FromSlice(lines), nil
+}
+
+// With calls fn to produce an Env and merges the result into env. It returns
+// an error if env is nil, if fn fails, or if the merge fails.
+func With(env *Env, fn func() (*Env, error)) (*Env, error) {
+	if env == nil {
+		return nil, fmt.Errorf("nil env")
+	}
+
+	n, err := fn()
+	if err != nil {
+		return nil, err
+	}
+
+	return env.Merge(n)
 }
